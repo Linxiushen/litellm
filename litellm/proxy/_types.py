@@ -613,6 +613,8 @@ class LiteLLMRoutes(enum.Enum):
             "/team/permissions_update",
             "/team/permissions_bulk_update",
             "/team/daily/activity",
+            # gateway request counts (SGR); deployment-wide, admin-only
+            "/gateway/daily/activity",
             # model
             "/model/new",
             "/model/update",
@@ -702,6 +704,7 @@ class LiteLLMRoutes(enum.Enum):
         "/global/spend/tags",
         "/global/predict/spend/logs",
         "/global/activity",
+        "/gateway/daily/activity",
         "/health/services",
     ] + info_routes
 

@@ -40,6 +40,7 @@ import CloudZeroExportModal from "@/components/cloudzero_export_modal";
 import EntityUsageExportModal from "@/components/EntityUsageExport";
 import { Team } from "@/components/key_team_helpers/key_list";
 import {
+  gatewayDailyActivityCall,
   Organization,
   tagListCall,
   userDailyActivityAggregatedCall,
@@ -66,12 +67,30 @@ interface UsagePageProps {
   organizations: Organization[];
 }
 
+/**
+ * Gateway request counts (SGR) from `/gateway/daily/activity`.
+ *
+ * Recorded by the proxy's request-metrics middleware rather than derived from
+ * spend logs, so it counts what the gateway actually answered. Deployment-wide
+ * with no per-key or per-user dimension, which is why it is admin-only and why
+ * the per-key and per-model breakdowns below still come from the spend tables.
+ */
+const GATEWAY_TOP_ROUTES = 15;
+
+interface GatewayActivity {
+  total_successful_requests: number;
+  total_failed_requests: number;
+  by_date: { date: string; successful_requests: number; failed_requests: number }[];
+  by_route: { category: string; route: string; successful_requests: number; failed_requests: number }[];
+}
+
 const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
   const { accessToken, userRole, userId: userID, premiumUser } = useAuthorized();
   // Aggregated endpoint: try first, fall back to paginated if unavailable
   const [aggregatedData, setAggregatedData] = useState<{ results: DailyData[]; metadata: any } | null>(null);
   const [aggregatedFailed, setAggregatedFailed] = useState(false);
   const [aggregatedLoading, setAggregatedLoading] = useState(false);
+  const [gatewayActivityData, setGatewayActivityData] = useState<GatewayActivity | null>(null);
 
   // Separate loading states for better UX
   const [isDateChanging, setIsDateChanging] = useState(false);
@@ -212,6 +231,28 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
         setAggregatedLoading(false);
       });
   }, [accessToken, startTime, endTime, effectiveUserId]);
+
+  // Gateway request counts (SGR). Admin-only: the source table is
+  // deployment-wide, so a non-admin must not see it.
+  const gatewayFetchIdRef = useRef(0);
+  useEffect(() => {
+    if (!accessToken || !startTime || !endTime || !isAdmin) return;
+    const fetchId = ++gatewayFetchIdRef.current;
+    gatewayDailyActivityCall(accessToken, startTime, endTime)
+      .then((data) => {
+        if (gatewayFetchIdRef.current !== fetchId) return;
+        setGatewayActivityData(data as GatewayActivity);
+      })
+      .catch(() => {
+        if (gatewayFetchIdRef.current !== fetchId) return;
+        setGatewayActivityData(null);
+      });
+  }, [accessToken, startTime, endTime, isAdmin]);
+
+  // Derived rather than cleared in the effect above: a non-admin must never see
+  // deployment-wide counts, and clearing state synchronously inside an effect
+  // triggers a cascading render.
+  const gatewayActivity = isAdmin ? gatewayActivityData : null;
 
   // Paginated fallback — only enabled when aggregated endpoint fails
   const paginatedResult = usePaginatedDailyActivity({
@@ -439,6 +480,17 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
     () => [...userSpendData.results].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
     [userSpendData.results],
   );
+  // by_route arrives sorted by successful_requests desc; cap it so a deployment
+  // exercising many endpoints does not render an unreadable axis.
+  const gatewayRequestsByRoute = useMemo(
+    () =>
+      (gatewayActivity?.by_route ?? []).slice(0, GATEWAY_TOP_ROUTES).map((entry) => ({
+        route: entry.category === "llm" ? entry.route : `${entry.category}${entry.route}`,
+        successful_requests: entry.successful_requests,
+        failed_requests: entry.failed_requests,
+      })),
+    [gatewayActivity],
+  );
   const modelMetrics = useMemo(
     () => processActivityData(userSpendData, modelViewType === "groups" ? "model_groups" : "models", teams),
     [userSpendData, modelViewType, teams],
@@ -616,9 +668,25 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                               </Text>
                             </Card>
                             <Card>
-                              <Title>Successful Requests</Title>
+                              <div className="flex items-center gap-2">
+                                <Title>Successful Requests</Title>
+                                {gatewayActivity && (
+                                  <Tooltip title="Counted by the gateway when it answers a request, independent of spend logging. Deployment-wide, so it will not match the per-key or per-model breakdowns below.">
+                                    <InfoCircleOutlined className="text-gray-400 hover:text-gray-600" />
+                                  </Tooltip>
+                                )}
+                              </div>
+                              {/*
+                                TODO: drop the userSpendData fallback once every deployment
+                                is writing LiteLLM_DailyGatewayRequests. It covers two cases
+                                today: a non-admin (who may not read deployment-wide counts)
+                                and an admin on a proxy whose table is still backfilling.
+                              */}
                               <Text className="text-2xl font-bold mt-2 text-green-600">
-                                {userSpendData.metadata?.total_successful_requests?.toLocaleString() || 0}
+                                {(
+                                  gatewayActivity?.total_successful_requests ??
+                                  userSpendData.metadata?.total_successful_requests
+                                )?.toLocaleString() || 0}
                               </Text>
                             </Card>
                             <Card>
@@ -729,6 +797,32 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                           </CardContent>
                         </ShadcnCard>
                       </Col>
+                      {/* Gateway Requests by Endpoint (SGR) */}
+                      {gatewayActivity && gatewayActivity.by_route.length > 0 && (
+                        <Col numColSpan={2}>
+                          <ShadcnCard>
+                            <CardHeader>
+                              <CardTitle className="text-base font-semibold">
+                                Gateway Requests by Endpoint
+                                <Tooltip title="Counted by the gateway middleware as each request is answered. Covers LLM, MCP and A2A endpoints across the whole deployment.">
+                                  <InfoCircleOutlined className="ml-2 text-gray-400 hover:text-gray-600" />
+                                </Tooltip>
+                              </CardTitle>
+                            </CardHeader>
+                            <CardContent>
+                              <BarChart
+                                data={gatewayRequestsByRoute}
+                                index="route"
+                                categories={["successful_requests", "failed_requests"]}
+                                colors={["green", "red"]}
+                                stack={true}
+                                yAxisWidth={100}
+                                valueFormatter={(value: number) => value.toLocaleString()}
+                              />
+                            </CardContent>
+                          </ShadcnCard>
+                        </Col>
+                      )}
                       {/* Top API Keys */}
                       <Col numColSpan={1}>
                         <Card className="h-full">
