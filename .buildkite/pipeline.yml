@@ -1,0 +1,243 @@
+steps:
+  - label: ":kubernetes: smoke — in-cluster agent"
+    key: eks-smoke
+    agents:
+      queue: "eks-stage"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: curlimages/curl:8.11.1
+                command:
+                  - |
+                    set -e
+                    echo "--- where am I"
+                    echo "pod:       $${HOSTNAME}"
+                    echo "namespace: $$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo '?')"
+                    echo "--- can I reach the proxy under test"
+                    curl -fsS -m 10 http://litellm-gateway.litellm.svc.cluster.local:4000/health/liveliness && echo " <- reachable"
+                    echo "--- can I read the e2e secrets (presence only, never the value)"
+                    [ -n "$${LITELLM_MASTER_KEY}" ] && echo "LITELLM_MASTER_KEY: present" || { echo "LITELLM_MASTER_KEY: MISSING"; exit 1; }
+                    [ -n "$${DD_API_KEY}" ] && echo "DD_API_KEY: present" || { echo "DD_API_KEY: MISSING"; exit 1; }
+                env:
+                  - name: LITELLM_MASTER_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: litellm-master-key
+                        key: master-key
+                  - name: DD_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: litellm-provider-keys
+                        key: DD_API_KEY
+
+  - input: ":mag: release candidate"
+    key: candidate
+    fields:
+      - text: "litellm commit SHA"
+        key: litellm_sha
+        hint: "Full 40-char SHA on litellm_internal_staging"
+
+  - wait: ~
+
+  - label: ":octocat: gate — GHA required checks"
+    key: gate-gha
+    depends_on: candidate
+    agents:
+      queue: "linux-small"
+    # meta-data is read on the agent, NOT inside the container: the docker
+    # plugin's image has no buildkite-agent binary, so reading it in-container
+    # exits 127. Resolve it here and pass the value in as an env var.
+    command: |
+      export LITELLM_SHA="$(buildkite-agent meta-data get litellm_sha)"
+      docker run --rm -v "$$PWD:/w" -w /w -e GITHUB_TOKEN -e LITELLM_SHA python:3.12-slim-bookworm ./.buildkite/gate-gha.py "$$LITELLM_SHA"
+
+  - label: ":docker: image — gateway e2e-<sha>"
+    key: image
+    depends_on: candidate
+    agents:
+      queue: "linux-medium"
+    timeout_in_minutes: 60
+    command: |
+      export LITELLM_SHA="$(buildkite-agent meta-data get litellm_sha)"
+      .buildkite/build-image.sh "$$LITELLM_SHA"
+
+  # Same idea for the RUNNER: litellm-e2e:e2e-<sha> bakes the test code from
+  # the input SHA (and stamps it into /app/e2e/.litellm-revision, which the
+  # entrypoint uploads to Test Engine as commit_sha). Builds from the bundled
+  # litellm-auto Dockerfile in .buildkite/runner/ — bundled because the
+  # agents have no token for the private litellm-auto repo; the Dockerfile
+  # itself fetches the (public) litellm test code. Requires the
+  # buildkite-e2e-ecr IAM policy to cover repository/litellm-e2e, not just
+  # litellm/gateway.
+  - label: ":docker: image — e2e runner e2e-<sha>"
+    key: runner-image
+    depends_on: candidate
+    agents:
+      queue: "linux-medium"
+    timeout_in_minutes: 60
+    command: |
+      export LITELLM_SHA="$(buildkite-agent meta-data get litellm_sha)"
+      .buildkite/build-runner-image.sh "$$LITELLM_SHA"
+
+  - group: ":test_tube: unit tests"
+    key: unit
+    steps:
+      - label: ":react: ui — utils"
+        key: ui-utils
+        command: .buildkite/run-ui.sh src/utils
+        agents:
+          queue: "linux-medium"
+        artifact_paths:
+          - "ui/litellm-dashboard/junit-ui.xml"
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+        plugins:
+          - docker#v5.11.0:
+              image: "node:20-bookworm-slim"
+              propagate-environment: true
+
+      - label: ":python: backend — types"
+        key: backend-types
+        command: .buildkite/run-unit.sh tests/test_litellm/types 2
+        agents:
+          queue: "linux-medium"
+        artifact_paths:
+          - "junit-*.xml"
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+        plugins:
+          - docker#v5.11.0:
+              image: "python:3.12-bookworm"
+              propagate-environment: true
+
+      - label: ":python: backend — router utils"
+        key: backend-router-utils
+        command: .buildkite/run-unit.sh tests/test_litellm/router_utils 2
+        agents:
+          queue: "linux-medium"
+        artifact_paths:
+          - "junit-*.xml"
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+        plugins:
+          - docker#v5.11.0:
+              image: "python:3.12-bookworm"
+              propagate-environment: true
+
+  - wait: ~
+
+  # PoC step 2: ephemeral per-SHA proxy stack (proxy + bundled Postgres +
+  # bundled Redis) helm-installed into the litellm namespace. Runs the
+  # gateway image tagged e2e-<litellm_sha>, produced (or idempotently
+  # re-tagged from a matching nightly) by the `image` step above.
+  # depends_on candidate + image, not the waits, so a red gate-gha can't
+  # block the PoC path — mirrors e2e-run. Release name carries the build
+  # number, and every rendered resource gets
+  # app.kubernetes.io/instance=<release>, never `litellm`,
+  # so ArgoCD ignores it and the litellm-gateway release is untouched.
+  # Auth: the pod's `default` ServiceAccount, bound to ClusterRole `edit`
+  # in this namespace only (RoleBinding e2e-poc-buildkite-jobs-edit —
+  # accepted-insecure PoC shortcut). Teardown: the e2e-teardown step below.
+  - label: ":helm: deploy — ephemeral per-SHA stack"
+    key: deploy-ephemeral
+    depends_on:
+      - candidate
+      - image
+    agents:
+      queue: "eks-stage"
+    timeout_in_minutes: 30
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: alpine/k8s:1.35.6
+                # ONE list element: the k8s plugin joins `command` into a
+                # single shell string instead of exec'ing argv.
+                command:
+                  - |
+                    set -eu
+                    LITELLM_SHA="$$(buildkite-agent meta-data get litellm_sha)"
+                    RELEASE="e2e-bk-$${BUILDKITE_BUILD_NUMBER}"
+                    echo "--- :helm: helm upgrade --install $${RELEASE} (image tag e2e-$${LITELLM_SHA})"
+                    helm upgrade --install "$${RELEASE}" ./helm/litellm-helm \
+                      --namespace litellm \
+                      --values .buildkite/e2e-ephemeral-values.yaml \
+                      --set-string image.repository=654278500801.dkr.ecr.us-east-1.amazonaws.com/litellm/gateway \
+                      --set-string "image.tag=e2e-$${LITELLM_SHA}"
+                    echo "--- :hourglass: wait for prisma migrations (fresh DB, several minutes)"
+                    sleep 10
+                    kubectl wait --for=condition=complete "job/$${RELEASE}-litellm-migrations" -n litellm --timeout=600s
+                    echo "--- :kubernetes: wait for proxy rollout"
+                    kubectl rollout status "deploy/$${RELEASE}-litellm" -n litellm --timeout=600s
+                    kubectl get pods -n litellm -l "app.kubernetes.io/instance=$${RELEASE}"
+                    echo "--- :stethoscope: liveliness"
+                    i=1
+                    while [ "$$i" -le 60 ]; do
+                      code="$$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$${RELEASE}-litellm.litellm.svc.cluster.local:4000/health/liveliness" || true)"
+                      echo "attempt $${i}: HTTP $${code}"
+                      if [ "$${code}" = "200" ]; then
+                        echo "ephemeral stack $${RELEASE} is live"
+                        exit 0
+                      fi
+                      i=$$((i+1))
+                      sleep 10
+                    done
+                    echo "liveliness never returned 200"
+                    exit 1
+
+  # PoC step 3: e2e-run + e2e-teardown live in .buildkite/step-e2e-run.yml,
+  # uploaded HERE mid-build. The runner image tag carries the input SHA,
+  # which is meta-data set AFTER the initial pipeline upload, so a static
+  # podSpec image field can never carry it (the ${BUILDKITE_BUILD_NUMBER}
+  # interpolations elsewhere work only because build-level vars exist at
+  # upload time). This step reads the meta-data on the agent, exports it,
+  # and `buildkite-agent pipeline upload` interpolates ${LITELLM_SHA} in the
+  # fragment from this job's environment. Uploaded steps insert right after
+  # this one, before the wait below, so the qa gate still covers them.
+  # depends_on candidate only: the fragment's own depends_on
+  # (deploy-ephemeral, runner-image) does the real sequencing, and uploading
+  # early keeps the teardown step registered before anything can fail. If
+  # THIS step fails after deploy-ephemeral ran, no teardown step exists —
+  # clean up manually (helm uninstall + pvc delete, see the fragment).
+  - label: ":arrow_up: e2e — upload per-SHA run steps"
+    key: e2e-upload
+    depends_on: candidate
+    agents:
+      queue: "linux-small"
+    command: |
+      export LITELLM_SHA="$(buildkite-agent meta-data get litellm_sha)"
+      buildkite-agent pipeline upload .buildkite/step-e2e-run.yml
+
+  - wait: ~
+
+  - block: ":hand: manual QA"
+    key: qa-gate
+    prompt: "Release candidate QA'd against this exact build?"
+    fields:
+      - select: "Verdict"
+        key: qa-verdict
+        options:
+          - label: "Pass — promote"
+            value: "pass"
+          - label: "Fail — hold"
+            value: "fail"
+      - text: "Notes"
+        key: qa-notes
+        required: false
+
+  - label: ":lock: sign + publish"
+    key: publish
+    depends_on: qa-gate
+    agents:
+      queue: "linux-small"
+    command: |
+      echo "--- placeholder for project-releaser"
+      echo "would promote the digest built from ${BUILDKITE_COMMIT}"
+      echo "nothing is published by this PoC"

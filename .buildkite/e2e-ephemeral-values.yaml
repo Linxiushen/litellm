@@ -1,0 +1,185 @@
+# Ephemeral per-SHA e2e stack values for helm/litellm-helm (PoC step 2).
+# proxy_config below mirrors the stage gateway's RENDERED config (configmap
+# litellm-gateway-config in the litellm namespace) — not the litellm-ops
+# overlay, which had drifted from the applied state (fallbacks, retention,
+# files_settings and finetune_settings were missing from the overlay copy).
+# Deliberate deltas vs stage's rendered config, all because the stack is
+# ephemeral and self-contained:
+#   - litellm_settings.cache_params has no host/port/ssl/startup-nodes: the
+#     chart injects REDIS_HOST/PORT/PASSWORD envs pointing at the bundled
+#     per-release redis, so the ephemeral stack never touches the shared
+#     stage ElastiCache. namespace + ttl kept for parity.
+#   - general_settings has no master_key/database_url/control_plane_url:
+#     the chart wires the master key + DATABASE_URL envs, and the ephemeral
+#     stack is single-deployment (no split control plane).
+#   - model_list matches stage's rendered config exactly (5 entries). The
+#     suite self-provisions every other model it needs via /model/new.
+# Env parity with the stage gateway deployment beyond the config:
+#   - environmentSecrets/environmentConfigMaps mirror stage's envFrom
+#     (litellm-license + litellm-provider-keys + litellm-env).
+#   - vertex-adc volume + GOOGLE_APPLICATION_CREDENTIALS mirror stage's
+#     mounted service-account file (litellm-provider-keys/
+#     VERTEXAI_CREDENTIALS at /var/secrets/vertex/credentials.json); vertex
+#     passthrough 401s without it.
+# Chart-level deltas vs the first draft of this file (all load-bearing):
+#   - envSecrets -> environmentSecrets (envSecrets is the componentized
+#     chart's key; this chart ignores it, so provider keys were never
+#     injected)
+#   - redis.auth.enabled: true (the chart unconditionally mounts
+#     <release>-redis/redis-password when redis.enabled; with auth off
+#     bitnami creates no secret and every proxy pod dies with
+#     CreateContainerConfigError)
+#   - args + envVars.CONFIG_FILE_PATH: the internal litellm/gateway image's
+#     entrypoint is `uvicorn gateway.main:app` (gateway/Dockerfile:100) and
+#     reads its config from CONFIG_FILE_PATH, unlike the OSS image this
+#     chart targets, whose CLI accepts the chart's default
+#     `--config /etc/litellm/config.yaml` args. Those defaults crash uvicorn
+#     ("No such option: --config"), so restore the image's own CMD and point
+#     CONFIG_FILE_PATH at the chart's config mount.
+#   - prometheus-multiproc emptyDir at /tmp/litellm_prometheus_multiproc:
+#     litellm-env sets PROMETHEUS_MULTIPROC_DIR to that path and
+#     prometheus_client refuses to start unless the directory exists
+#     (ValueError at app startup); the componentized chart mounts an
+#     emptyDir there for the live gateway, so mirror it.
+replicaCount: 2
+image:
+  repository: 654278500801.dkr.ecr.us-east-1.amazonaws.com/litellm/gateway
+  pullPolicy: IfNotPresent
+db:
+  useExisting: false
+  deployStandalone: true
+redis:
+  enabled: true
+  architecture: standalone
+  coordination:
+    enabled: true
+  auth:
+    enabled: true
+migrationJob:
+  enabled: true
+  disableSchemaUpdate: false
+masterkeySecretName: litellm-master-key
+masterkeySecretKey: master-key
+environmentSecrets:
+- litellm-license
+- litellm-provider-keys
+environmentConfigMaps:
+- litellm-env
+args:
+- --host
+- 0.0.0.0
+- --port
+- '4000'
+envVars:
+  CONFIG_FILE_PATH: /etc/litellm/config.yaml
+  GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/vertex/credentials.json
+volumes:
+- name: prometheus-multiproc
+  emptyDir:
+    sizeLimit: 500Mi
+- name: vertex-adc
+  secret:
+    secretName: litellm-provider-keys
+    items:
+    - key: VERTEXAI_CREDENTIALS
+      path: credentials.json
+volumeMounts:
+- name: prometheus-multiproc
+  mountPath: /tmp/litellm_prometheus_multiproc
+- name: vertex-adc
+  mountPath: /var/secrets/vertex
+  readOnly: true
+nodeSelector:
+  karpenter.sh/nodepool: litellm-worker-t3
+tolerations:
+- key: workload
+  operator: Equal
+  value: litellm
+  effect: NoSchedule
+ingress:
+  enabled: false
+proxy_config:
+  general_settings:
+    proxy_config_reload_interval_seconds: 7
+    store_prompts_in_spend_logs: true
+    database_connection_pool_limit: 10
+    forward_client_headers_to_llm_api: false
+    maximum_spend_logs_retention_period: 60d
+    maximum_spend_logs_cleanup_cron: 0 1 * * *
+    alerts:
+    - email
+    mcp_trusted_proxy_ranges:
+    - 0.0.0.0
+    proxy_budget_rescheduler_min_time: 15
+    proxy_budget_rescheduler_max_time: 20
+  litellm_settings:
+    drop_params: true
+    default_redis_ttl: 20
+    request_timeout: 600
+    num_retries: 3
+    json_logs: true
+    store_audit_logs: true
+    cache: true
+    cache_params:
+      type: redis
+      namespace: litellm.caching
+      ttl: 16600
+    callbacks:
+    - arize_phoenix
+    - datadog
+    - smtp_email
+    - prometheus
+    - otel
+    require_auth_for_metrics_endpoint: false
+  router_settings:
+    routing_strategy: simple-shuffle
+    num_retries: 3
+    allowed_fails: 5
+    cooldown_time: 30
+    fallbacks:
+    - gemini-2.5-flash:
+      - gpt-5.5
+      - claude-haiku-4-5
+  model_list:
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: gemini-2.5-flash-vertex
+    litellm_params:
+      model: vertex_ai/gemini-2.5-flash
+      vertex_project: os.environ/VERTEXAI_PROJECT
+      vertex_location: us-central1
+      vertex_credentials: os.environ/VERTEXAI_CREDENTIALS
+  - model_name: gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  files_settings:
+  - custom_llm_provider: openai
+    api_key: os.environ/OPENAI_API_KEY
+  - custom_llm_provider: azure
+    api_base: os.environ/AZURE_API_BASE
+    api_key: os.environ/AZURE_API_KEY
+    api_version: 2024-07-01-preview
+  - custom_llm_provider: vertex_ai
+    vertex_project: os.environ/VERTEXAI_PROJECT
+    vertex_location: us-central1
+    vertex_credentials: os.environ/VERTEXAI_CREDENTIALS
+    bucket_name: os.environ/GCS_BUCKET_NAME
+  finetune_settings:
+  - custom_llm_provider: openai
+    api_key: os.environ/OPENAI_API_KEY
+  mcp_servers:
+    devin:
+      url: https://mcp.devin.ai/mcp
+      auth_type: api_key
+      auth_value: os.environ/DEVIN_API_KEY
