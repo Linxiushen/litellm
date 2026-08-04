@@ -1,0 +1,21 @@
+# Declarative DB-state seed for the ephemeral per-SHA e2e stack, applied by
+# seed-e2e.py between deploy-ephemeral and e2e-run: every model listed here
+# is registered through /model/new (the same path the Admin UI uses) unless
+# a model with that model_name already exists.
+#
+# Syntax: JSON (a YAML subset), parsed with stdlib json after full-line
+# comments are stripped. Each entry is a /model/new request body, credentials
+# always as os.environ/... references resolved from the proxy's own env
+# (litellm-provider-keys); never a literal secret, never a pg_dump of stage.
+#
+# The list starts EMPTY on purpose. Auditing stage's 1400+ DB-registered
+# models showed they are self-provisioning-test debris, not required ambient
+# state: batches, spend_tracking, claude_code, rerank, and realtime all
+# register their own deployments via /model/new and tear them down. Add an
+# entry here only when a suite failure proves a test expects a DB-backed
+# model to pre-exist.
+#
+# Make-it-right home: tests/e2e/environment/ in the litellm repo, baked into
+# the e2e runner image so tests and environment contract version together.
+# The pipeline dir is the PoC home.
+{"models": []}

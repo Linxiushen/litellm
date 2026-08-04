@@ -1,0 +1,241 @@
+# e2e-run + e2e-teardown, uploaded mid-build by the e2e-upload step. These
+# two live here instead of pipeline.yml because the runner image tag carries
+# the input SHA (meta-data, set after the initial upload) and a static podSpec
+# image field can never see it. The e2e-upload step exports LITELLM_SHA and
+# runs `buildkite-agent pipeline upload` on this file, which interpolates
+# ${LITELLM_SHA} and ${BUILDKITE_BUILD_NUMBER} from that job's environment.
+# This file goes through exactly ONE upload -> the $$ escapes for runtime
+# shell vars are the same as when these steps lived in pipeline.yml.
+steps:
+  # Idempotent DB-state seeder + admin-plane readiness gate. Reads
+  # .buildkite/e2e-seed.yaml (from the pod's checkout, same as
+  # deploy-ephemeral reads the values file) and registers anything missing
+  # via /model/new; today the manifest is empty by evidence (the suite
+  # self-provisions its models), so this step's real job is failing in
+  # seconds when the admin plane or master-key wiring is broken instead of
+  # 40 minutes into the suite. e2e-run depends on it.
+  - label: ":seedling: seed — e2e environment"
+    key: seed-e2e
+    depends_on: deploy-ephemeral
+    agents:
+      queue: "eks-stage"
+    timeout_in_minutes: 10
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: python:3.12-slim-bookworm
+                command:
+                  - |
+                    exec python3 .buildkite/seed-e2e.py
+                env:
+                - name: LITELLM_PROXY_URL
+                  value: http://e2e-bk-${BUILDKITE_BUILD_NUMBER}-litellm.litellm.svc.cluster.local:4000
+                - name: LITELLM_MASTER_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: master-key
+                      name: litellm-master-key
+
+  # The suite targets the ephemeral per-SHA stack. The proxy/redis hostnames
+  # bake in the build number via SINGLE-$ ${BUILDKITE_BUILD_NUMBER}. $$ would
+  # leave a literal ${...} in the k8s env value, which nothing ever expands
+  # (no shell, and k8s only expands $(VAR)). REDIS_HOST must be the SAME redis
+  # the ephemeral proxy uses (the chart's bundled redis-master), or the
+  # suite's coordination assertions would test the wrong instance; the
+  # bundled redis is standalone + plaintext + password-auth (bitnami secret
+  # <release>-redis), so REDIS_CLUSTER/REDIS_SSL/REDIS_PASSWORD override the
+  # suite's deployed-shape defaults (TLS + cluster, from stage ElastiCache).
+  # LITELLM_MASTER_KEY stays: the chart reuses the existing litellm-master-key
+  # secret.
+  #
+  # The image is litellm-e2e:e2e-<litellm_sha>, ensured by the runner-image
+  # step (skip if present, else build with LITELLM_REF=<sha>). Its baked
+  # /app/e2e/.litellm-revision == <sha> (verified before push), so the
+  # entrypoint's Test Engine upload attributes the run to the input SHA.
+  - label: ":microscope: e2e — full suite"
+    key: e2e-run
+    depends_on:
+      - deploy-ephemeral
+      - runner-image
+      - seed-e2e
+    agents:
+      queue: "eks-stage"
+    timeout_in_minutes: 180
+    plugins:
+      - kubernetes:
+          podSpec:
+            nodeSelector:
+              karpenter.sh/nodepool: litellm-worker-t3
+            # That nodepool is tainted workload=litellm:NoSchedule, so without
+            # this the pod sits Pending until the controller's 15m timeout
+            # kills it. Mirrors the toleration on the ArgoCD-managed Job.
+            tolerations:
+              - key: workload
+                operator: Equal
+                value: litellm
+                effect: NoSchedule
+            containers:
+              - image: 654278500801.dkr.ecr.us-east-1.amazonaws.com/litellm-e2e:e2e-${LITELLM_SHA}
+                # The image's real entrypoint is `run-e2e` (ENTRYPOINT
+                # ["run-e2e"], WorkingDir /app). /app/entrypoint.sh does not
+                # exist in this image; the agent-stack bootstrap replaces the
+                # ENTRYPOINT and runs this shell string from the checkout dir
+                # — hence the explicit cd so the suite runs the image's tests,
+                # not the checkout's.
+                command:
+                  - |
+                    cd /app && exec run-e2e -v
+                env:
+                - name: LITELLM_PROXY_URL
+                  value: http://e2e-bk-${BUILDKITE_BUILD_NUMBER}-litellm.litellm.svc.cluster.local:4000
+                - name: LITELLM_MASTER_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: master-key
+                      name: litellm-master-key
+                - name: REQUIRE_PROXY
+                  value: '1'
+                - name: TEST_MODE
+                  value: full
+                - name: DRY_RUN_TEST_COUNT
+                  value: '3'
+                - name: E2E_POLL_TIMEOUT
+                  value: '120'
+                - name: E2E_POLL_INTERVAL
+                  value: '5'
+                - name: E2E_REQUEST_TIMEOUT
+                  value: '60'
+                - name: E2E_LOAD_DURATION_SECONDS
+                  value: '180'
+                - name: REDIS_HOST
+                  value: e2e-bk-${BUILDKITE_BUILD_NUMBER}-redis-master.litellm.svc.cluster.local
+                - name: REDIS_PORT
+                  value: '6379'
+                - name: REDIS_CLUSTER
+                  value: 'false'
+                - name: REDIS_SSL
+                  value: 'false'
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      key: redis-password
+                      name: e2e-bk-${BUILDKITE_BUILD_NUMBER}-redis
+                - name: E2E_LOAD_USERS
+                  value: '100'
+                - name: E2E_LOAD_SPAWN_RATE
+                  value: '25'
+                - name: E2E_LOAD_MIN_RPS
+                  value: '50'
+                - name: E2E_OTEL_QUERY_URL
+                  value: http://jaeger.monitoring.svc.cluster.local:16686
+                - name: E2E_UI_ARTIFACT_DIR
+                  value: /tmp/playwright-artifacts
+                - name: PRESIDIO_ANALYZER_API_BASE
+                  valueFrom:
+                    secretKeyRef:
+                      key: PRESIDIO_ANALYZER_API_BASE
+                      name: litellm-provider-keys
+                - name: PRESIDIO_ANONYMIZER_API_BASE
+                  valueFrom:
+                    secretKeyRef:
+                      key: PRESIDIO_ANONYMIZER_API_BASE
+                      name: litellm-provider-keys
+                - name: LANGFUSE_PUBLIC_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: LANGFUSE_PUBLIC_KEY
+                      name: litellm-provider-keys
+                - name: LANGFUSE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: LANGFUSE_SECRET_KEY
+                      name: litellm-provider-keys
+                - name: LANGFUSE_BASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      key: LANGFUSE_BASE_URL
+                      name: litellm-provider-keys
+                - name: DD_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: DD_API_KEY
+                      name: litellm-provider-keys
+                - name: DD_APP_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: DD_APP_KEY
+                      name: litellm-provider-keys
+                - name: DD_SITE
+                  valueFrom:
+                    secretKeyRef:
+                      key: DD_SITE
+                      name: litellm-provider-keys
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: ANTHROPIC_API_KEY
+                      name: litellm-provider-keys
+                - name: COHERE_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      key: COHERE_API_KEY
+                      name: litellm-provider-keys
+                - name: AWS_ROLE_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      key: AWS_ROLE_NAME
+                      name: litellm-provider-keys
+                - name: BEDROCK_GUARDRAIL_IDENTIFIER
+                  valueFrom:
+                    secretKeyRef:
+                      key: BEDROCK_GUARDRAIL_IDENTIFIER
+                      name: litellm-provider-keys
+                - name: BEDROCK_GUARDRAIL_VERSION
+                  valueFrom:
+                    secretKeyRef:
+                      key: BEDROCK_GUARDRAIL_VERSION
+                      name: litellm-provider-keys
+                - name: BUILDKITE_ANALYTICS_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      key: BUILDKITE_ANALYTICS_TOKEN
+                      name: litellm-provider-keys
+
+  # Always-runs teardown. allow_dependency_failure fires it when e2e-run
+  # fails or its job is cancelled; soft_fail keeps the build outcome
+  # reflecting the tests, never the cleanup. A build-level cancel still kills
+  # this step too — that leak needs the same two commands run manually.
+  # The state capture before uninstall doubles as evidence the suite ran
+  # against this release. helm uninstall leaves StatefulSet PVCs behind,
+  # hence the explicit pvc delete by instance label.
+  - label: ":broom: teardown — ephemeral per-SHA stack"
+    key: e2e-teardown
+    depends_on:
+      - e2e-run
+    allow_dependency_failure: true
+    soft_fail: true
+    agents:
+      queue: "eks-stage"
+    timeout_in_minutes: 15
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: alpine/k8s:1.35.6
+                command:
+                  - |
+                    set -eu
+                    RELEASE="e2e-bk-$${BUILDKITE_BUILD_NUMBER}"
+                    echo "--- :mag: state before teardown ($${RELEASE})"
+                    kubectl get pods -n litellm -l "app.kubernetes.io/instance=$${RELEASE}" -o wide || true
+                    echo "--- :bar_chart: coordination redis keyspace (nonzero = proxy served traffic)"
+                    kubectl exec -n litellm "$${RELEASE}-redis-master-0" -- redis-cli DBSIZE || true
+                    echo "--- :page_facing_up: proxy log tail"
+                    kubectl logs -n litellm -l "app.kubernetes.io/instance=$${RELEASE},app.kubernetes.io/name=litellm" --tail=15 --prefix=true || true
+                    echo "--- :broom: helm uninstall"
+                    helm uninstall "$${RELEASE}" -n litellm --wait --timeout 5m --ignore-not-found
+                    echo "--- :broom: delete leftover PVCs"
+                    kubectl delete pvc -n litellm -l "app.kubernetes.io/instance=$${RELEASE}" --ignore-not-found
+                    echo "--- :white_check_mark: what remains for $${RELEASE} (expect no resources)"
+                    kubectl get all,pvc -n litellm -l "app.kubernetes.io/instance=$${RELEASE}" || true
