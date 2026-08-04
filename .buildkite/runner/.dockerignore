@@ -1,0 +1,6 @@
+# Build context only needs the Dockerfile, requirements.txt and entrypoint.sh;
+# the test suite is cloned inside the image.
+.git
+.github
+helm
+*.md
