@@ -359,3 +359,56 @@ async def test_disclosure_agrees_with_the_resolver_on_a_shared_target(monkeypatc
 
     assert len(destinations) == 1
     assert resolved_logging_exporter_names(None, None) == ("dup-one", "dup-two")
+
+
+# --- destination_for_credential: which backend owns the destination ----------
+
+
+def test_backend_without_a_preset_is_owned_by_the_generic_passthrough():
+    """Regression: a destination naming a backend with no preset lost its gen-AI span.
+
+    ``build_destination`` serves any unrecognized backend through the generic OTLP
+    passthrough, but the backend name is also what activates a v2 logger, and the
+    gen-AI span only fans out to destinations tagged with an activated logger's name.
+    An unrecognized name activated nothing, so the destination received the request
+    tree and never the ``chat <model>`` span. It has to be reported as ``generic``,
+    the backend whose logger actually serves it.
+    """
+    from litellm.proxy.management_endpoints.logging_exporter_access import (
+        destination_for_credential,
+    )
+
+    resolved = destination_for_credential(
+        CredentialItem(
+            credential_name="honeycomb-dest",
+            credential_values={"otel_endpoint": "http://collector.example/v1/traces"},
+            credential_info={"credential_type": "logging", "description": "honeycomb"},
+        )
+    )
+
+    assert resolved is not None
+    backend, destination = resolved
+    assert backend == "generic"
+    assert destination.endpoint == "http://collector.example/v1/traces"
+
+
+def test_backend_with_a_preset_keeps_its_own_name():
+    """The generic fallback must not swallow a real backend: an adapter-backed
+    destination stays tagged with its own backend so it keeps that backend's mapper
+    vocabulary and dynamic-credential routing."""
+    from litellm.proxy.management_endpoints.logging_exporter_access import (
+        destination_for_credential,
+    )
+
+    resolved = destination_for_credential(
+        CredentialItem(
+            credential_name="arize-dest",
+            credential_values={"arize_space_id": "space", "arize_api_key": "key"},
+            credential_info={"credential_type": "logging", "description": "arize"},
+        )
+    )
+
+    assert resolved is not None
+    backend, destination = resolved
+    assert backend == "arize"
+    assert destination.headers == {"space_id": "space", "api_key": "key"}

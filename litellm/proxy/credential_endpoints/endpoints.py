@@ -278,7 +278,10 @@ def update_db_credential(
         merged_credential.credential_values.update(encrypted_params)
 
     if encrypted_credential.credential_info:
-        merged_credential.credential_info = encrypted_credential.credential_info
+        merged_credential.credential_info = {
+            **(db_credential.credential_info or {}),
+            **encrypted_credential.credential_info,
+        }
 
     return merged_credential
 
@@ -344,10 +347,10 @@ def _sync_in_memory_credential(
 
     Skips when the credential isn't resident in memory (e.g. created on
     another scaled instance, restored from DB on the next reload).
-    ``credential_info`` is replaced exactly as the DB write replaces it, so the
-    routing-live copy and the stored row can't disagree; values merge, matching
-    the DB's ``update``. Diverging here would hide a lost field until the next
-    reload swapped the in-memory copy for the row that never had it.
+    ``credential_info`` merges by top-level key exactly as the DB write merges it,
+    so the routing-live copy and the stored row can't disagree; values merge,
+    matching the DB's ``update``. Diverging here would hide a lost field until the
+    next reload swapped the in-memory copy for the row that never had it.
     """
     existing_in_memory: CredentialItem | None = None
     for cred in litellm.credential_list:
@@ -360,9 +363,10 @@ def _sync_in_memory_credential(
     in_memory_values = dict(existing_in_memory.credential_values or {})
     if patch.credential_values:
         in_memory_values.update(patch.credential_values)
-    in_memory_info = (
-        dict(patch.credential_info) if patch.credential_info else dict(existing_in_memory.credential_info or {})
-    )
+    in_memory_info = {
+        **(existing_in_memory.credential_info or {}),
+        **(patch.credential_info or {}),
+    }
     updated_in_memory = CredentialItem(
         credential_name=merged.credential_name,
         credential_values=in_memory_values,

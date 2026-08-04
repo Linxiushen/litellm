@@ -127,9 +127,14 @@ def destination_for_credential(credential: CredentialItem) -> 'tuple[str, "OtelD
     from litellm.integrations.otel.presets import PRESET_BY_CALLBACK
     from litellm.integrations.otel.presets.destinations import build_destination
 
-    backend = (credential.credential_info or {}).get("description")
-    if not backend:
+    named_backend = (credential.credential_info or {}).get("description")
+    if not named_backend:
         return None
+    # A backend with no preset activates no v2 logger, so its destination would receive
+    # the request tree but never the gen-AI span. ``build_destination`` already serves it
+    # through the generic OTLP passthrough; naming it ``generic`` puts it under the logger
+    # that passthrough belongs to, so the trace arrives whole.
+    backend = named_backend if named_backend in PRESET_BY_CALLBACK else "generic"
     # Drop unset (``None``) values rather than stringifying them: ``str(None)`` is the
     # literal ``"None"``, which would land in the exporter endpoint/headers and break
     # the export (e.g. an empty ``otel_endpoint`` becoming the URL ``"None"``).

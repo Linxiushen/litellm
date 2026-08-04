@@ -26,31 +26,32 @@ def _admin():
     return UserAPIKeyAuth(api_key="k", user_role=LitellmUserRoles.PROXY_ADMIN)
 
 
-# --- credential_info replace semantics, identical for every credential kind ---
+# --- credential_info merge semantics, identical for every credential kind ---
 
 @pytest.mark.parametrize(
     "info, patch_info, expected",
     [
         (
-            {"custom_llm_provider": "openai", "stale": "keepout"},
+            {"custom_llm_provider": "openai", "description": "keepme"},
             {"custom_llm_provider": "azure"},
-            {"custom_llm_provider": "azure"},
+            {"custom_llm_provider": "azure", "description": "keepme"},
         ),
         (
             {"credential_type": "logging", "description": "arize", "access": {"global": True}},
-            {"credential_type": "logging", "description": "arize", "access": {"teams": ["t1"]}},
+            {"access": {"teams": ["t1"]}},
             {"credential_type": "logging", "description": "arize", "access": {"teams": ["t1"]}},
         ),
     ],
     ids=["provider", "logging-destination"],
 )
-def test_update_db_credential_replaces_info_wholesale(info, patch_info, expected):
-    """``credential_info`` is replaced, never merged, for every credential kind.
+def test_update_db_credential_merges_info_by_top_level_key(info, patch_info, expected):
+    """A partial PATCH body must not delete the ``credential_info`` keys it omits.
 
-    The caller sends the whole object (the body model requires it), so a replace is
-    lossless and omitted keys are a deliberate removal. Special-casing logging
-    destinations with a subfield merge is what let a fragment reach the write path and
-    silently delete sibling metadata such as ``custom_llm_provider``.
+    ``PATCH /credentials`` takes a partial body and the Admin UI's credential form only
+    resends the keys it renders, so replacing the column wholesale silently dropped
+    stored keys such as ``description`` on every UI edit. A key present in the patch
+    still wins outright, so re-scoping a destination replaces the whole ``access``
+    object instead of unioning grants
     """
     from litellm.proxy.credential_endpoints.endpoints import update_db_credential
 
@@ -86,7 +87,11 @@ def test_sync_in_memory_credential_mirrors_the_db_row(monkeypatch):
     merged = CredentialItem(
         credential_name="openai-prod",
         credential_values={"api_key": "enc"},
-        credential_info={"description": "just a label"},
+        credential_info={
+            "custom_llm_provider": "openai",
+            "keepme": "important",
+            "description": "just a label",
+        },
     )
 
     _sync_in_memory_credential(old_name="openai-prod", merged=merged, patch=patch)
