@@ -942,3 +942,22 @@ async def test_disable_team_logging_leaves_team_re_enablable():
 
     written = json.loads(mock_prisma.db.litellm_teamtable.update.await_args.kwargs["data"]["metadata"])
     assert [entry["callback_name"] for entry in written["logging"]] == ["langfuse"]
+
+
+def test_callback_vars_reject_a_var_no_logging_path_consumes():
+    """Regression: a callback var nothing consumes is forwarded to the provider.
+
+    ``callback_vars`` are unpacked onto the request body in
+    ``add_litellm_data_to_request``; only the keys the logging layer recognizes
+    (``StandardCallbackDynamicParams``) are stripped before the upstream call. Admitting
+    ``litellm_logging_credential_name``, which no code reads, let an admin set a var on a
+    team once and break every completion that team makes with a provider 400 on an
+    unexpected body field. Destination routing is decided by the credential's ``access``,
+    never by a team-supplied var.
+    """
+    with pytest.raises(ValueError, match="Invalid callback variable"):
+        AddTeamCallback(
+            callback_name="otel",
+            callback_type="success",
+            callback_vars={"litellm_logging_credential_name": "gen-dest"},
+        )
